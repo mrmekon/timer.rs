@@ -8,7 +8,7 @@ use std::thread;
 use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc::{channel, Sender};
 use std::collections::BinaryHeap;
-    
+//use std::boxed::FnBox;
 use chrono::{Duration, DateTime, UTC};
 
 /// An item scheduled for delayed execution.
@@ -17,7 +17,8 @@ struct Schedule {
     date: DateTime<UTC>,
 
     /// The callback to execute.
-    cb: Box<Fn() + Send>
+    cb: Box<FnMut() + Send>
+    // Really, it should be a `FnOnce`, but `Box<FnOnce>` doens't work yet.
 }
 impl Ord for Schedule {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -75,6 +76,7 @@ impl Scheduler {
             heap: BinaryHeap::with_capacity(capacity),
         }
     }
+
     fn run(&mut self) {
         let ref waiter = *self.waiter;
         loop {
@@ -96,8 +98,10 @@ impl Scheduler {
                 let now = UTC::now();
                 if let Some(sched) = self.heap.peek() {
                     if sched.date > now {
-                        // First item is not ready yet, so nothing is ready.
-                        // We assume that `sched.date > now` is still true.
+                        // First item is not ready yet, so nothing is
+                        // ready.  We behave as if `sched.date > now`
+                        // is still true. In the worst case, we'll
+                        // fire a bit too late.
                         delay = Some(sched.date - now);
                         break;
                     }
@@ -106,7 +110,8 @@ impl Scheduler {
                     break;
                 }
                 let sched = self.heap.pop().unwrap(); // We just checked that the heap is not empty.
-                (sched.cb)();
+                let mut cb = sched.cb;
+                cb(); // We don't want to know whether the communication succeeded.
             }
 
             match delay {
@@ -164,31 +169,38 @@ impl Timer {
         // messages to the second thread without having to wait too
         // long for the mutex.
         let (tx, rx) = channel();
-        thread::spawn(move || {
-            use Op::*;
-            let ref waiter = *waiter_send;
-            for msg in rx.iter() {
-                let mut vec = waiter.messages.lock().unwrap();
-                match msg {
-                    Schedule(sched) => {
-                        vec.push(Schedule(sched));
-                        waiter.condvar.notify_one();
-                    }
-                    Stop => {
-                        vec.clear();
-                        vec.push(Op::Stop);
-                        waiter.condvar.notify_one();
-                        return;
+        thread::Builder::new()
+            .name("Timer: Communication thread".to_owned())
+            .spawn(move || {
+                use Op::*;
+                let ref waiter = *waiter_send;
+                for msg in rx.iter() {
+                    let mut vec = waiter.messages.lock().unwrap();
+                    match msg {
+                        Schedule(sched) => {
+                            vec.push(Schedule(sched));
+                            waiter.condvar.notify_one();
+                        }
+                        Stop => {
+                            vec.clear();
+                            vec.push(Op::Stop);
+                            waiter.condvar.notify_one();
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            })
+            .unwrap();
 
         // Spawn a second thread, in charge of scheduling.
-        thread::Builder::new().name("Timer thread".to_owned()).spawn(move || {
-            let mut scheduler = Scheduler::with_capacity(waiter_recv, capacity);
-            scheduler.run()
-        }).unwrap();
+        thread::Builder::new()
+            .name("Timer: Scheduler thread".to_owned())
+            .spawn(move || {
+                let mut scheduler = Scheduler::with_capacity(waiter_recv, capacity);
+                scheduler.run()
+            })
+            .unwrap();
+
         Timer {
             tx: tx
         }
@@ -235,9 +247,9 @@ impl Timer {
     /// rx.recv().unwrap();
     /// println!("This code has been executed after 3 seconds");
     /// ```
-    pub fn schedule_with_delay<F>(&self, delay: Duration, cb: F)
-        where F: 'static + Fn() + Send {
-        self.schedule_with_date(UTC::now() + delay, cb)
+    pub fn schedule_with_delay<T>(&self, delay: Duration, tx: Sender<T>, value: T)
+        where T: Send + 'static {
+        self.schedule_with_date(UTC::now() + delay, tx, value)
     }
 
     /// Schedule a callback for execution at a given date.
@@ -248,23 +260,17 @@ impl Timer {
     ///
     /// If the date is in the past, the callback is executed as soon
     /// as possible.
-    ///
-    /// # Performance
-    ///
-    /// The callback is executed on the Scheduler thread. It should
-    /// therefore terminate very quickly, or risk causing delaying
-    /// other callbacks.
-    ///
-    /// # Failures
-    ///
-    /// Any failure in `cb` will scheduler thread and progressively
-    /// contaminate the Timer and the calling thread itself. You have
-    /// been warned.
-    pub fn schedule_with_date<F>(&self, date: DateTime<UTC>, cb: F)
-        where F: 'static + Fn() + Send {
+    pub fn schedule_with_date<T>(&self, date: DateTime<UTC>, tx: Sender<T>, value: T)
+        where T: Send + 'static {
+
+        // Hack to replace a move with a `take()`, as `Box<FnOnce>`
+        // doesn't work yet.
+        let mut wrapper = Some(value); 
         self.tx.send(Op::Schedule(Schedule {
             date: date,
-            cb: Box::new(cb)
+            cb: Box::new(move || {
+                let _ignored = tx.send(wrapper.take().unwrap());
+            })
         })).unwrap();
     }
 }
@@ -280,11 +286,7 @@ fn test_schedule_with_delay() {
     let start = UTC::now();
     for i in delays.clone() {
         println!("Scheduling for execution in {} seconds", i);
-        let tx = tx.clone();
-        timer.schedule_with_delay(Duration::seconds(i), move || {
-            println!("Callback {}", i);
-            tx.send(i).unwrap();
-        });
+        timer.schedule_with_delay(Duration::seconds(i), tx.clone());
     }
 
     delays.sort();
@@ -300,11 +302,7 @@ fn test_schedule_with_delay() {
     let start = UTC::now();
     for i in vec![10, 0] {
         println!("Scheduling for execution in {} seconds", i);
-        let tx = tx.clone();
-        timer.schedule_with_delay(Duration::seconds(i), move || {
-            println!("Callback {}", i);
-            tx.send(i).unwrap();
-        });
+        timer.schedule_with_delay(Duration::seconds(i), tx.clone());
     }
 
     assert_eq!(rx.recv().unwrap(), 0);
@@ -312,25 +310,17 @@ fn test_schedule_with_delay() {
 }
 
 #[test]
-fn test_schedule_and_panic() {
+fn test_schedule_and_close() {
+    println!("Schedule a number of sends and close the receivers.");
     let timer = Timer::new();
-    for i in 0..1000 {
+    for i in 0..100 {
         let (tx, rx) = channel();
-        timer.schedule_with_delay(Duration::milliseconds(i), move || {
-            println!("Received callback {}, preparing to panic", i);
-            if true {
-                panic!("Testing the behavior in presence of a panic");
-            } else {
-                tx.send(()).unwrap();
-            }
-        });
-        assert!(rx.try_recv().is_err());
+        timer.schedule_with_delay(Duration::milliseconds(i), tx);
+        drop(rx);
     }
 
+    println!("We should still be able to receive from further sends.");
     let (tx, rx) = channel();
-    timer.schedule_with_delay(Duration::seconds(1), move || {
-        println!("Received final callback, don't panic");
-        tx.send(()).unwrap();
-    });
+    timer.schedule_with_delay(Duration::seconds(1), tx);
     rx.try_recv().unwrap();
 }
