@@ -178,7 +178,7 @@ impl <T,E> Scheduler<T,E> where E : Executor<T> {
                     if sched.date > now {
                         // First item is not ready yet, so we need to
                         // wait until it is or something happens.
-                        sleep = Sleep::AtMost(sched.date - now);
+                        sleep = Sleep::AtMost(sched.date.signed_duration_since(now));
                         break;
                     }
                 } else {
